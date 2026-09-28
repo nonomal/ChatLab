@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { ref, watch, computed, onMounted } from 'vue'
+import { ref, watch, computed, onMounted, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { useToast } from '@nuxt/ui/runtime/composables/useToast.js'
+import { useToast } from '@/composables/useToast'
 import { useAssistantStore, type AssistantConfigFull } from '@/stores/assistant'
 
 const { t } = useI18n()
@@ -10,6 +10,7 @@ const props = defineProps<{
   open: boolean
   assistantId: string | null
   readonly?: boolean
+  scrollToSection?: string
 }>()
 
 const emit = defineEmits<{
@@ -36,24 +37,20 @@ const chatTypeOptions = computed(() => [
 const localeOptions = [
   { value: 'zh', label: '简体中文' },
   { value: 'en', label: 'English' },
+  { value: 'ja', label: '日本語' },
 ]
 
-const BUILTIN_TS_TOOLS = computed(() =>
-  assistantStore.builtinTsToolNames.map((name) => ({
-    name,
-    description: t(`ai.assistant.builtinToolDesc.${name}`),
-  }))
+const coreTools = computed(() =>
+  assistantStore.builtinToolCatalog
+    .filter((e) => e.category === 'core')
+    .map((e) => ({ name: e.name, description: t(`ai.assistant.builtinToolDesc.${e.name}`) }))
 )
 
-interface ToolForm {
-  name: string
-  description: string
-  parametersJson: string
-  query: string
-  rowTemplate: string
-  summaryTemplate: string
-  fallback: string
-}
+const analysisTools = computed(() =>
+  assistantStore.builtinToolCatalog
+    .filter((e) => e.category === 'analysis')
+    .map((e) => ({ name: e.name, description: t(`ai.assistant.builtinToolDesc.${e.name}`) }))
+)
 
 const form = ref({
   name: '',
@@ -64,30 +61,14 @@ const form = ref({
   allowedBuiltinTools: [] as string[],
 })
 
-const customSqlTools = ref<ToolForm[]>([])
 const newQuestion = ref('')
-const expandedToolIndex = ref<number | null>(null)
+const presetQuestionsRef = ref<HTMLElement | null>(null)
 
-const toolGroups = computed(() => [
-  { label: t('ai.assistant.config.toolGroupQuery'), tools: BUILTIN_TS_TOOLS.value },
-  { label: t('ai.assistant.config.toolGroupSql'), tools: assistantStore.builtinSqlTools },
-])
-
-const allBuiltinTools = computed(() => [...BUILTIN_TS_TOOLS.value, ...assistantStore.builtinSqlTools])
-
-const hasCustomTools = computed(() => customSqlTools.value.length > 0)
-const toolBadgeCount = computed(() => {
-  const builtinCount = form.value.allowedBuiltinTools.length
-  const customCount = customSqlTools.value.filter((t) => t.name.trim()).length
-  return builtinCount + customCount
-})
+const toolBadgeCount = computed(() => form.value.allowedBuiltinTools.length)
 
 onMounted(async () => {
-  if (assistantStore.builtinTsToolNames.length === 0) {
-    await assistantStore.loadBuiltinTsToolNames()
-  }
-  if (assistantStore.builtinSqlTools.length === 0) {
-    await assistantStore.loadBuiltinSqlTools()
+  if (assistantStore.builtinToolCatalog.length === 0) {
+    await assistantStore.loadBuiltinToolCatalog()
   }
 })
 
@@ -103,42 +84,15 @@ watch(
       isCreateMode.value = true
       initEmptyForm()
     }
+    if (props.scrollToSection === 'presetQuestions') {
+      await nextTick()
+      setTimeout(() => {
+        presetQuestionsRef.value?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      }, 100)
+    }
   },
   { immediate: true }
 )
-
-function toolDefToForm(tool: any): ToolForm {
-  return {
-    name: tool.name || '',
-    description: tool.description || '',
-    parametersJson: JSON.stringify(tool.parameters || { type: 'object', properties: {}, required: [] }, null, 2),
-    query: tool.execution?.query || '',
-    rowTemplate: tool.execution?.rowTemplate || '',
-    summaryTemplate: tool.execution?.summaryTemplate || '',
-    fallback: tool.execution?.fallback || '',
-  }
-}
-
-function formToToolDef(tf: ToolForm): any {
-  let parameters: any
-  try {
-    parameters = JSON.parse(tf.parametersJson)
-  } catch {
-    parameters = { type: 'object', properties: {}, required: [] }
-  }
-  return {
-    name: tf.name,
-    description: tf.description,
-    parameters,
-    execution: {
-      type: 'sqlite',
-      query: tf.query,
-      rowTemplate: tf.rowTemplate,
-      summaryTemplate: tf.summaryTemplate || undefined,
-      fallback: tf.fallback,
-    },
-  }
-}
 
 function initEmptyForm() {
   config.value = {
@@ -147,9 +101,6 @@ function initEmptyForm() {
     systemPrompt: '',
     presetQuestions: [],
     allowedBuiltinTools: [],
-    customSqlTools: [],
-    version: 1,
-    order: 100,
     applicableChatTypes: [],
     supportedLocales: [],
   }
@@ -161,8 +112,6 @@ function initEmptyForm() {
     supportedLocales: [],
     allowedBuiltinTools: [],
   }
-  customSqlTools.value = []
-  expandedToolIndex.value = null
   isLoading.value = false
 }
 
@@ -179,12 +128,10 @@ async function loadConfig(id: string) {
         supportedLocales: [...(config.value.supportedLocales || [])],
         allowedBuiltinTools: [...(config.value.allowedBuiltinTools || [])],
       }
-      customSqlTools.value = (config.value.customSqlTools || []).map(toolDefToForm)
-      expandedToolIndex.value = null
     }
   } catch (error) {
     console.error('[AssistantConfigModal] Failed to load config:', error)
-    toast.add({ title: t('ai.assistant.toast.loadFailed'), description: String(error), color: 'error' })
+    toast.fail(t('ai.assistant.toast.loadFailed'), { description: String(error) })
   } finally {
     isLoading.value = false
   }
@@ -193,8 +140,6 @@ async function loadConfig(id: string) {
 async function handleSave() {
   isSaving.value = true
   try {
-    const customTools = customSqlTools.value.filter((t) => t.name.trim()).map(formToToolDef)
-
     const payload = {
       name: form.value.name,
       systemPrompt: form.value.systemPrompt,
@@ -204,40 +149,35 @@ async function handleSave() {
         : ([] as ('group' | 'private')[]),
       supportedLocales: [...form.value.supportedLocales],
       allowedBuiltinTools: [...form.value.allowedBuiltinTools],
-      customSqlTools: customTools,
     }
 
     if (isCreateMode.value) {
       const result = await assistantStore.createAssistant(payload)
       if (result.success) {
-        toast.add({ title: t('ai.assistant.toast.createSuccess'), color: 'success' })
+        toast.success(t('ai.assistant.toast.createSuccess'))
         emit('created', result.id!)
         closeModal()
       } else {
-        toast.add({
-          title: t('ai.assistant.toast.createFailed'),
+        toast.fail(t('ai.assistant.toast.createFailed'), {
           description: result.error || t('ai.assistant.toast.unknownError'),
-          color: 'error',
         })
       }
     } else {
       if (!props.assistantId) return
       const result = await assistantStore.updateAssistant(props.assistantId, payload)
       if (result.success) {
-        toast.add({ title: t('ai.assistant.toast.saveSuccess'), color: 'success' })
+        toast.success(t('ai.assistant.toast.saveSuccess'))
         emit('saved')
         closeModal()
       } else {
-        toast.add({
-          title: t('ai.assistant.toast.saveFailed'),
+        toast.fail(t('ai.assistant.toast.saveFailed'), {
           description: result.error || t('ai.assistant.toast.unknownError'),
-          color: 'error',
         })
       }
     }
   } catch (error) {
     console.error('[AssistantConfigModal] Save failed:', error)
-    toast.add({ title: t('ai.assistant.toast.saveFailed'), description: String(error), color: 'error' })
+    toast.fail(t('ai.assistant.toast.saveFailed'), { description: String(error) })
   } finally {
     isSaving.value = false
   }
@@ -250,18 +190,16 @@ async function handleReset() {
   try {
     const result = await assistantStore.resetAssistant(props.assistantId)
     if (result.success) {
-      toast.add({ title: t('ai.assistant.toast.resetSuccess'), color: 'success' })
+      toast.success(t('ai.assistant.toast.resetSuccess'))
       await loadConfig(props.assistantId)
       emit('saved')
     } else {
-      toast.add({
-        title: t('ai.assistant.toast.resetFailed'),
+      toast.fail(t('ai.assistant.toast.resetFailed'), {
         description: result.error || t('ai.assistant.toast.unknownError'),
-        color: 'error',
       })
     }
   } catch (error) {
-    toast.add({ title: t('ai.assistant.toast.resetFailed'), description: String(error), color: 'error' })
+    toast.fail(t('ai.assistant.toast.resetFailed'), { description: String(error) })
   } finally {
     isSaving.value = false
   }
@@ -288,43 +226,16 @@ function toggleBuiltinTool(toolName: string) {
   }
 }
 
-function isToolChecked(toolName: string): boolean {
-  if (form.value.allowedBuiltinTools.length === 0) return true
+function isAnalysisToolChecked(toolName: string): boolean {
   return form.value.allowedBuiltinTools.includes(toolName)
 }
 
-function selectAllTools() {
-  form.value.allowedBuiltinTools = allBuiltinTools.value.map((t) => t.name)
+function selectAllAnalysisTools() {
+  form.value.allowedBuiltinTools = analysisTools.value.map((t) => t.name)
 }
 
-function clearAllTools() {
+function clearAllAnalysisTools() {
   form.value.allowedBuiltinTools = []
-}
-
-function addCustomTool() {
-  customSqlTools.value.push({
-    name: '',
-    description: '',
-    parametersJson: JSON.stringify({ type: 'object', properties: {}, required: [] }, null, 2),
-    query: '',
-    rowTemplate: '',
-    summaryTemplate: '',
-    fallback: t('ai.assistant.config.toolFallbackDefault'),
-  })
-  expandedToolIndex.value = customSqlTools.value.length - 1
-}
-
-function removeCustomTool(index: number) {
-  customSqlTools.value.splice(index, 1)
-  if (expandedToolIndex.value === index) {
-    expandedToolIndex.value = null
-  } else if (expandedToolIndex.value !== null && expandedToolIndex.value > index) {
-    expandedToolIndex.value--
-  }
-}
-
-function toggleCustomTool(index: number) {
-  expandedToolIndex.value = expandedToolIndex.value === index ? null : index
 }
 
 function selectChatType(value: string) {
@@ -478,12 +389,12 @@ function closeModal() {
                 <p class="mt-1 text-[10px] text-gray-400">{{ t('ai.assistant.config.localeHint') }}</p>
               </div>
 
-              <div>
+              <div ref="presetQuestionsRef">
                 <label class="mb-1.5 block text-sm font-medium text-gray-700 dark:text-gray-300">
                   {{ t('ai.assistant.config.presetQuestions') }}
                 </label>
                 <div class="space-y-2">
-                  <div v-for="(q, index) in form.presetQuestions" :key="index" class="flex items-center gap-2">
+                  <div v-for="(_, index) in form.presetQuestions" :key="index" class="flex items-center gap-2">
                     <UInput
                       v-model="form.presetQuestions[index]"
                       class="min-w-0 flex-1"
@@ -522,197 +433,78 @@ function closeModal() {
             </div>
 
             <!-- 工具管理 Tab -->
-            <div v-show="activeTab === 'tools'" class="space-y-6">
-              <!-- 内置工具勾选区 -->
+            <div v-show="activeTab === 'tools'" class="space-y-5">
+              <!-- 核心工具区（始终启用） -->
               <div>
-                <div class="mb-2 flex items-center justify-between">
+                <h3 class="mb-1 text-sm font-medium text-gray-700 dark:text-gray-300">
+                  {{ t('ai.assistant.config.coreTools') }}
+                </h3>
+                <p class="mb-2.5 text-[10px] text-gray-400">
+                  {{ t('ai.assistant.config.coreToolsHint') }}
+                </p>
+                <div class="grid grid-cols-2 gap-1.5">
+                  <label
+                    v-for="tool in coreTools"
+                    :key="tool.name"
+                    class="flex items-start gap-2 rounded-md border border-gray-200 bg-gray-50/50 px-2.5 py-2 opacity-70 dark:border-gray-700 dark:bg-gray-800/30"
+                  >
+                    <input
+                      type="checkbox"
+                      checked
+                      disabled
+                      class="mt-0.5 h-3.5 w-3.5 shrink-0 rounded border-gray-300 text-gray-400"
+                    />
+                    <div class="min-w-0">
+                      <div class="truncate text-xs font-medium text-gray-600 dark:text-gray-400">{{ tool.name }}</div>
+                      <div class="truncate text-[10px] text-gray-400 dark:text-gray-500">{{ tool.description }}</div>
+                    </div>
+                  </label>
+                </div>
+              </div>
+
+              <!-- 分析工具区（按需开启） -->
+              <div>
+                <div class="mb-1 flex items-center justify-between">
                   <h3 class="text-sm font-medium text-gray-700 dark:text-gray-300">
-                    {{ t('ai.assistant.config.builtinTools') }}
+                    {{ t('ai.assistant.config.analysisTools') }}
                   </h3>
                   <div v-if="!readonly" class="flex gap-2">
-                    <button class="text-[10px] text-primary-500 hover:text-primary-600" @click="selectAllTools">
+                    <button class="text-[10px] text-primary-500 hover:text-primary-600" @click="selectAllAnalysisTools">
                       {{ t('ai.assistant.config.selectAll') }}
                     </button>
                     <span class="text-[10px] text-gray-300 dark:text-gray-600">|</span>
-                    <button class="text-[10px] text-primary-500 hover:text-primary-600" @click="clearAllTools">
+                    <button class="text-[10px] text-primary-500 hover:text-primary-600" @click="clearAllAnalysisTools">
                       {{ t('ai.assistant.config.deselectAll') }}
                     </button>
                   </div>
                 </div>
-                <p class="mb-3 text-[10px] text-gray-400">
-                  {{ t('ai.assistant.config.builtinToolsHint') }}
+                <p class="mb-2.5 text-[10px] text-gray-400">
+                  {{ t('ai.assistant.config.analysisToolsHint') }}
                 </p>
-                <div v-for="(group, gi) in toolGroups" :key="gi" class="mb-3 last:mb-0">
-                  <h4 class="mb-1.5 text-xs font-medium text-gray-500 dark:text-gray-400">{{ group.label }}</h4>
-                  <div class="grid grid-cols-2 gap-1.5">
-                    <label
-                      v-for="tool in group.tools"
-                      :key="tool.name"
-                      class="flex cursor-pointer items-start gap-2 rounded-md border px-2.5 py-2 transition-colors"
-                      :class="
-                        isToolChecked(tool.name)
-                          ? 'border-primary-200 bg-primary-50/50 dark:border-primary-800 dark:bg-primary-950/20'
-                          : 'border-gray-200 dark:border-gray-700'
-                      "
-                    >
-                      <input
-                        type="checkbox"
-                        :checked="form.allowedBuiltinTools.includes(tool.name)"
-                        :disabled="readonly"
-                        class="mt-0.5 h-3.5 w-3.5 shrink-0 rounded border-gray-300 text-primary-600 focus:ring-primary-500"
-                        @change="toggleBuiltinTool(tool.name)"
-                      />
-                      <div class="min-w-0">
-                        <div class="truncate text-xs font-medium text-gray-800 dark:text-gray-200">{{ tool.name }}</div>
-                        <div class="truncate text-[10px] text-gray-500 dark:text-gray-400">{{ tool.description }}</div>
-                      </div>
-                    </label>
-                  </div>
-                </div>
-              </div>
-
-              <!-- 分割线 -->
-              <div class="border-t border-gray-200 dark:border-gray-700" />
-
-              <!-- 自定义 SQL 工具区 -->
-              <div>
-                <h3 class="mb-2 text-sm font-medium text-gray-700 dark:text-gray-300">
-                  {{ t('ai.assistant.config.customSqlTools') }}
-                  <span v-if="hasCustomTools" class="ml-1 text-xs font-normal text-gray-400">
-                    （{{ customSqlTools.length }}）
-                  </span>
-                </h3>
-                <p class="mb-3 text-[10px] text-gray-400">
-                  {{ t('ai.assistant.config.customSqlToolsHint') }}
-                </p>
-
-                <div
-                  v-for="(tool, index) in customSqlTools"
-                  :key="index"
-                  class="mb-2 rounded-lg border border-gray-200 dark:border-gray-700"
-                >
-                  <div
-                    class="flex cursor-pointer items-center justify-between px-3 py-2"
-                    @click="toggleCustomTool(index)"
+                <div class="grid grid-cols-2 gap-1.5">
+                  <label
+                    v-for="tool in analysisTools"
+                    :key="tool.name"
+                    class="flex cursor-pointer items-start gap-2 rounded-md border px-2.5 py-2 transition-colors"
+                    :class="
+                      isAnalysisToolChecked(tool.name)
+                        ? 'border-primary-200 bg-primary-50/50 dark:border-primary-800 dark:bg-primary-950/20'
+                        : 'border-gray-200 dark:border-gray-700'
+                    "
                   >
-                    <span class="text-sm font-medium text-gray-800 dark:text-gray-200">
-                      {{ tool.name || t('ai.assistant.config.toolUntitled', { index: index + 1 }) }}
-                    </span>
-                    <div class="flex items-center gap-1">
-                      <UButton
-                        v-if="!readonly"
-                        color="error"
-                        variant="ghost"
-                        icon="i-heroicons-trash"
-                        size="xs"
-                        @click.stop="removeCustomTool(index)"
-                      />
-                      <UIcon
-                        :name="expandedToolIndex === index ? 'i-heroicons-chevron-up' : 'i-heroicons-chevron-down'"
-                        class="h-4 w-4 text-gray-400"
-                      />
+                    <input
+                      type="checkbox"
+                      :checked="isAnalysisToolChecked(tool.name)"
+                      :disabled="readonly"
+                      class="mt-0.5 h-3.5 w-3.5 shrink-0 rounded border-gray-300 text-primary-600 focus:ring-primary-500"
+                      @change="toggleBuiltinTool(tool.name)"
+                    />
+                    <div class="min-w-0">
+                      <div class="truncate text-xs font-medium text-gray-800 dark:text-gray-200">{{ tool.name }}</div>
+                      <div class="truncate text-[10px] text-gray-500 dark:text-gray-400">{{ tool.description }}</div>
                     </div>
-                  </div>
-
-                  <div
-                    v-if="expandedToolIndex === index"
-                    class="space-y-3 border-t border-gray-200 px-3 py-3 dark:border-gray-700"
-                  >
-                    <div>
-                      <label class="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-400">
-                        {{ t('ai.assistant.config.toolName') }}
-                      </label>
-                      <UInput
-                        v-model="tool.name"
-                        size="sm"
-                        class="w-full"
-                        :placeholder="t('ai.assistant.config.toolNamePlaceholder')"
-                        :disabled="readonly"
-                      />
-                    </div>
-                    <div>
-                      <label class="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-400">
-                        {{ t('ai.assistant.config.toolDesc') }}
-                      </label>
-                      <UInput
-                        v-model="tool.description"
-                        size="sm"
-                        class="w-full"
-                        :placeholder="t('ai.assistant.config.toolDescPlaceholder')"
-                        :disabled="readonly"
-                      />
-                    </div>
-                    <div>
-                      <label class="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-400">
-                        {{ t('ai.assistant.config.toolParams') }}
-                      </label>
-                      <UTextarea
-                        v-model="tool.parametersJson"
-                        :rows="4"
-                        class="w-full font-mono text-xs"
-                        :disabled="readonly"
-                      />
-                    </div>
-                    <div>
-                      <label class="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-400">
-                        {{ t('ai.assistant.config.toolQuery') }}
-                      </label>
-                      <UTextarea
-                        v-model="tool.query"
-                        :rows="4"
-                        class="w-full font-mono text-xs"
-                        :disabled="readonly"
-                        :placeholder="t('ai.assistant.config.toolQueryPlaceholder')"
-                      />
-                    </div>
-                    <div>
-                      <label class="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-400">
-                        {{ t('ai.assistant.config.toolRowTemplate') }}
-                      </label>
-                      <UInput
-                        v-model="tool.rowTemplate"
-                        size="sm"
-                        class="w-full"
-                        :placeholder="t('ai.assistant.config.toolRowTemplatePlaceholder')"
-                        :disabled="readonly"
-                      />
-                    </div>
-                    <div>
-                      <label class="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-400">
-                        {{ t('ai.assistant.config.toolFallback') }}
-                      </label>
-                      <UInput
-                        v-model="tool.fallback"
-                        size="sm"
-                        class="w-full"
-                        :placeholder="t('ai.assistant.config.toolFallbackPlaceholder')"
-                        :disabled="readonly"
-                      />
-                    </div>
-                    <div>
-                      <label class="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-400">
-                        {{ t('ai.assistant.config.toolSummary') }}
-                      </label>
-                      <UInput
-                        v-model="tool.summaryTemplate"
-                        size="sm"
-                        class="w-full"
-                        :placeholder="t('ai.assistant.config.toolSummaryPlaceholder')"
-                        :disabled="readonly"
-                      />
-                    </div>
-                  </div>
+                  </label>
                 </div>
-
-                <button
-                  v-if="!readonly"
-                  type="button"
-                  class="flex w-full items-center justify-center gap-1.5 rounded-lg border-2 border-dashed border-gray-300 py-3 text-xs text-gray-500 transition-colors hover:border-primary-400 hover:text-primary-600 dark:border-gray-600 dark:text-gray-400 dark:hover:border-primary-500 dark:hover:text-primary-400"
-                  @click="addCustomTool"
-                >
-                  <UIcon name="i-heroicons-plus" class="h-4 w-4" />
-                  {{ t('ai.assistant.config.addCustomTool') }}
-                </button>
               </div>
             </div>
           </div>

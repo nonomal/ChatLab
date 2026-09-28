@@ -1,83 +1,373 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref, watch, onMounted, onUnmounted } from 'vue'
 import { useI18n } from 'vue-i18n'
-import type { AnalysisSession } from '@/types/base'
+import { useDark } from '@vueuse/core'
+import * as echarts from 'echarts/core'
+import { HeatmapChart, CustomChart } from 'echarts/charts'
+import { CalendarComponent, TooltipComponent, VisualMapComponent } from 'echarts/components'
+import { CanvasRenderer } from 'echarts/renderers'
+import type { EChartsOption } from 'echarts'
+import type { AnalysisSession, MessageType } from '@/types/base'
+import type { DailyActivity, HourlyActivity } from '@/types/analysis'
 import { formatDateRange } from '@/utils'
+import { ReportCard } from '@/components/UI'
+import { useOverviewStatistics } from '@/composables/analysis/useOverviewStatistics'
+import { getOverviewCalendarRange, resolveOverviewTimeRange } from '@/composables/analysis/overviewTimeRange'
+import { useWeekdayActivity } from '@/composables/analysis/useWeekdayActivity'
+import OverviewStatCards from './OverviewStatCards.vue'
 
-const { t } = useI18n()
+echarts.use([HeatmapChart, CustomChart, CalendarComponent, TooltipComponent, VisualMapComponent, CanvasRenderer])
 
-const props = defineProps<{
-  session: AnalysisSession
-  totalDurationDays: number
-  totalDailyAvgMessages: number
-  timeRange: { start: number; end: number } | null
-}>()
+const { t, locale } = useI18n()
+const isDark = useDark()
 
-// 聊天记录起止时间（完整范围）
-const fullTimeRangeText = computed(() => {
-  if (!props.timeRange) return ''
-  return formatDateRange(props.timeRange.start, props.timeRange.end, 'YYYY/MM/DD')
+const props = withDefaults(
+  defineProps<{
+    session: AnalysisSession
+    dailyActivity: DailyActivity[]
+    messageTypes: Array<{ type: MessageType; count: number }>
+    hourlyActivity: HourlyActivity[]
+    timeRange: { start: number; end: number } | null
+    filteredMessageCount: number
+    filteredMemberCount?: number
+    timeFilter?: { startTs?: number; endTs?: number }
+    capturable?: boolean
+  }>(),
+  {
+    capturable: true,
+  }
+)
+
+// ==================== 统计数据 ====================
+
+const { weekdayActivity } = useWeekdayActivity({
+  sessionId: () => props.session.id,
+  timeFilter: () => props.timeFilter,
+})
+
+const {
+  durationDays,
+  displayMessageCount,
+  dailyAvgMessages,
+  imageCount,
+  peakHour,
+  peakWeekday,
+  weekdayNames,
+  weekdayVsWeekend,
+  peakDay,
+  activeDays,
+  totalDays,
+  activeRate,
+  lateNightChat,
+  maxConsecutiveDays,
+} = useOverviewStatistics(props, weekdayActivity)
+
+// ==================== 热力图 ====================
+
+const chartRef = ref<HTMLElement | null>(null)
+let chartInstance: echarts.ECharts | null = null
+
+const effectiveTimeRange = computed(() => resolveOverviewTimeRange(props.timeRange, props.timeFilter))
+
+const timeRangeText = computed(() => {
+  if (!effectiveTimeRange.value) return ''
+  return formatDateRange(effectiveTimeRange.value.start, effectiveTimeRange.value.end, 'YYYY/MM/DD')
+})
+
+const calendarRange = computed<[string, string]>(() => {
+  const range = getOverviewCalendarRange(effectiveTimeRange.value)
+  if (range) return range
+
+  const today = new Date()
+  const fmt = (d: Date) => d.toISOString().slice(0, 10)
+  const todayStr = fmt(today)
+  return [todayStr, todayStr]
+})
+
+const chartData = computed(() => {
+  const [startStr, endStr] = calendarRange.value
+  const startDate = new Date(startStr + 'T00:00:00Z')
+  const endDate = new Date(endStr + 'T00:00:00Z')
+
+  const dict = new Map<string, number>()
+  props.dailyActivity
+    .filter((d) => d.date >= startStr && d.date <= endStr)
+    .forEach((d) => dict.set(d.date, d.messageCount))
+
+  const res: any[] = []
+  const curr = new Date(startDate)
+  while (curr <= endDate) {
+    const dStr = curr.toISOString().slice(0, 10)
+    const val = dict.get(dStr) || 0
+    res.push({
+      value: [dStr, val],
+      itemStyle: val === 0 ? { color: emptyColor.value } : undefined,
+    })
+    curr.setUTCDate(curr.getUTCDate() + 1)
+  }
+  return res
+})
+
+const maxValue = computed(() => {
+  if (props.dailyActivity.length === 0) return 10
+  return Math.max(...props.dailyActivity.map((d) => d.messageCount), 1)
+})
+
+const themeColors = {
+  light: ['#fce4ec', '#f8a4b8', '#f06292', '#e91e63'],
+  // 消息越少，颜色越透明越灰白（不显眼）；消息越多，颜色越是实心的亮深粉色（视觉浓度更高）
+  dark: ['rgba(238, 69, 103, 0.15)', 'rgba(238, 69, 103, 0.45)', 'rgba(238, 69, 103, 0.75)', 'rgba(238, 69, 103, 1)'],
+}
+
+// 采用微透明的拟态毛玻璃底色，与 ThemeCard 的背景/光晕能够完美融合
+const emptyColor = computed(() => (isDark.value ? 'rgba(255, 255, 255, 0.04)' : '#ebedf0'))
+
+const chartOption = computed<EChartsOption>(() => ({
+  tooltip: {
+    trigger: 'item',
+    formatter: (params: any) => {
+      const date = params.value[0]
+      const value = params.value[1]
+      return `${date}<br/>${t('views.message.calendarTooltipMessages')}: ${value}`
+    },
+  },
+  visualMap: {
+    min: 1,
+    max: maxValue.value,
+    calculable: false,
+    orient: 'horizontal',
+    left: 'center',
+    bottom: 0,
+    itemWidth: 10,
+    itemHeight: 80,
+    text: [`${maxValue.value}`, '1'],
+    inRange: {
+      color: isDark.value ? themeColors.dark : themeColors.light,
+    },
+    textStyle: {
+      color: isDark.value ? '#8b949e' : '#6b7280',
+      fontSize: 10,
+    },
+    show: true,
+  },
+  calendar: {
+    top: 20,
+    left: 30,
+    cellSize: [13, 13],
+    range: calendarRange.value,
+    itemStyle: {
+      borderWidth: 0,
+      color: 'transparent',
+    },
+    yearLabel: { show: false },
+    monthLabel: {
+      show: true,
+      color: isDark.value ? '#8b949e' : '#6b7280',
+      fontSize: 10,
+      nameMap: [
+        t('common.month.jan'),
+        t('common.month.feb'),
+        t('common.month.mar'),
+        t('common.month.apr'),
+        t('common.month.may'),
+        t('common.month.jun'),
+        t('common.month.jul'),
+        t('common.month.aug'),
+        t('common.month.sep'),
+        t('common.month.oct'),
+        t('common.month.nov'),
+        t('common.month.dec'),
+      ],
+    },
+    dayLabel: {
+      show: true,
+      firstDay: 1,
+      color: isDark.value ? '#8b949e' : '#9ca3af',
+      fontSize: 10,
+      nameMap: [
+        t('common.weekday.sun'),
+        t('common.weekday.mon'),
+        t('common.weekday.tue'),
+        t('common.weekday.wed'),
+        t('common.weekday.thu'),
+        t('common.weekday.fri'),
+        t('common.weekday.sat'),
+      ],
+    },
+    splitLine: { show: false },
+  },
+  series: [
+    {
+      type: 'custom',
+      coordinateSystem: 'calendar',
+      data: chartData.value,
+      renderItem: (params: any, api: any) => {
+        const cellPoint = api.coord(api.value(0))
+        const cellWidth = params.coordSys.cellWidth
+        const cellHeight = params.coordSys.cellHeight
+
+        // 每个格子的边长减去 3 像素，从而形成真正的透明物理间隙，透出底部光效
+        const size = Math.min(cellWidth, cellHeight) - 3
+
+        return {
+          type: 'rect',
+          shape: {
+            x: cellPoint[0] - size / 2,
+            y: cellPoint[1] - size / 2,
+            width: size,
+            height: size,
+            r: 3, // 圆角
+          },
+          style: {
+            fill: api.visual('color'),
+          },
+        }
+      },
+      itemStyle: {
+        // 对于白天的细微高光补充（非必需，保持干净）
+        borderColor: isDark.value ? 'transparent' : 'rgba(0,0,0,0.02)',
+        borderWidth: 1,
+      },
+    },
+  ],
+}))
+
+function initChart() {
+  if (!chartRef.value) return
+  chartInstance = echarts.init(chartRef.value, undefined, { renderer: 'canvas' })
+  chartInstance.setOption({ backgroundColor: 'transparent', ...chartOption.value })
+}
+
+function updateChart() {
+  if (!chartInstance) return
+  chartInstance.setOption({ backgroundColor: 'transparent', ...chartOption.value }, { notMerge: true })
+}
+
+function handleResize() {
+  chartInstance?.resize()
+}
+
+watch([() => props.dailyActivity, locale, calendarRange], () => updateChart())
+
+watch(isDark, () => {
+  chartInstance?.dispose()
+  initChart()
+})
+
+onMounted(() => {
+  initChart()
+  window.addEventListener('resize', handleResize)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('resize', handleResize)
+  chartInstance?.dispose()
 })
 </script>
 
 <template>
-  <div
-    class="relative overflow-hidden rounded-3xl bg-gradient-to-br from-pink-500 to-pink-600 p-8 shadow-sm ring-1 ring-pink-600 dark:bg-gray-800/50 dark:from-transparent dark:to-transparent dark:ring-gray-800"
-  >
-    <div class="relative flex gap-8">
-      <div class="flex-1">
-        <div>
-          <div class="flex items-center gap-3">
-            <h2 class="text-3xl font-black tracking-tight text-white">{{ session.name }}</h2>
-            <span
-              class="rounded-full bg-white px-3 py-1 text-xs font-medium text-pink-600 dark:bg-pink-500/10 dark:text-pink-400"
-            >
+  <ReportCard :capturable="capturable">
+    <!-- 身份信息 + 基础统计 -->
+    <div class="relative z-10 px-5 pt-6 pb-4 sm:px-8 sm:pt-8">
+      <h2 class="text-2xl font-bold tracking-tight text-gray-900 sm:text-3xl dark:text-gray-100">
+        {{ session.name }}
+      </h2>
+
+      <div class="mt-4 flex flex-col gap-5 sm:flex-row sm:flex-wrap sm:items-start sm:gap-x-24">
+        <div class="min-w-0 flex shrink-0 flex-col gap-2 text-sm font-medium text-gray-500 dark:text-gray-400">
+          <div class="flex items-center gap-2">
+            <div class="flex h-6 w-6 shrink-0 items-center justify-center">
+              <UIcon v-if="session.type === 'group'" name="i-heroicons-user-group" class="h-4 w-4 opacity-70" />
+              <UIcon v-else name="i-heroicons-user" class="h-4 w-4 opacity-70" />
+            </div>
+            <span class="whitespace-nowrap">
               {{ session.platform.toUpperCase() }}
+              ·
+              {{
+                session.type === 'private'
+                  ? t('analysis.overview.identity.privateChat')
+                  : t('analysis.overview.identity.groupChat')
+              }}
             </span>
           </div>
-          <p class="mt-2 text-lg font-medium text-pink-100 dark:text-gray-400">
-            {{
-              session.type === 'private'
-                ? t('analysis.overview.identity.privateChat')
-                : t('analysis.overview.identity.groupChat')
-            }}
-            ·
-            <span class="opacity-80">{{ t('analysis.overview.identity.analysisReport') }}</span>
-          </p>
-          <!-- 聊天记录起止时间 -->
-          <p v-if="fullTimeRangeText" class="mt-2 text-sm font-medium text-pink-100/90 dark:text-gray-400">
-            {{ fullTimeRangeText }}
-          </p>
+
+          <div v-if="timeRangeText" class="flex items-center gap-2">
+            <div class="flex h-6 w-6 shrink-0 items-center justify-center">
+              <UIcon name="i-heroicons-calendar" class="h-4 w-4 opacity-70" />
+            </div>
+            <span class="font-mono text-xs opacity-90 whitespace-nowrap">{{ timeRangeText }}</span>
+          </div>
         </div>
 
-        <div class="mt-8 grid grid-cols-3 gap-6">
-          <div class="rounded-2xl bg-white/10 px-6 py-4 dark:bg-gray-800">
-            <p class="text-3xl font-black tracking-tight text-white">
-              {{ session.messageCount.toLocaleString() }}
-            </p>
-            <p class="mt-1 text-sm font-medium text-pink-100 dark:text-gray-400">
+        <div class="grid grid-cols-2 gap-x-8 gap-y-4 sm:flex sm:shrink-0 sm:gap-6">
+          <div class="flex flex-col gap-1 text-center">
+            <span class="text-2xl font-black font-mono tracking-tight text-gray-900 dark:text-white">
+              {{ displayMessageCount.toLocaleString() }}
+            </span>
+            <span class="text-xs font-medium text-gray-500 dark:text-gray-400">
               {{ t('analysis.overview.identity.totalMessages') }}
-            </p>
+            </span>
           </div>
-          <div class="rounded-2xl bg-white/10 px-6 py-4 dark:bg-gray-800">
-            <p class="text-3xl font-black tracking-tight text-white">{{ totalDurationDays }}</p>
-            <p class="mt-1 text-sm font-medium text-pink-100 dark:text-gray-400">
+
+          <div class="flex flex-col gap-1 text-center">
+            <span class="text-2xl font-black font-mono tracking-tight text-gray-900 dark:text-white">
+              {{ durationDays.toLocaleString() }}
+            </span>
+            <span class="text-xs font-medium text-gray-500 dark:text-gray-400">
               {{ t('analysis.overview.identity.durationDays') }}
-            </p>
+            </span>
           </div>
-          <div class="rounded-2xl bg-white/10 px-6 py-4 dark:bg-gray-800">
-            <p class="text-3xl font-black tracking-tight text-white">{{ totalDailyAvgMessages }}</p>
-            <p class="mt-1 text-sm font-medium text-pink-100 dark:text-gray-400">
+
+          <div class="flex flex-col gap-1 text-center">
+            <span class="text-2xl font-black font-mono tracking-tight text-gray-900 dark:text-white">
+              {{ activeDays.toLocaleString() }}
+            </span>
+            <span class="text-xs font-medium text-gray-500 dark:text-gray-400">
+              {{ t('analysis.overview.identity.activeDays') }}
+            </span>
+          </div>
+
+          <div class="flex flex-col gap-1 text-center">
+            <span class="text-2xl font-black font-mono tracking-tight text-gray-900 dark:text-white">
+              {{ dailyAvgMessages.toLocaleString() }}
+            </span>
+            <span class="text-xs font-medium text-gray-500 dark:text-gray-400">
               {{ t('analysis.overview.identity.dailyAvgMessages') }}
-            </p>
+            </span>
           </div>
         </div>
-      </div>
-
-      <!-- 右侧工具区插槽 -->
-      <div v-if="$slots.tools" class="flex flex-none flex-col justify-end">
-        <slot name="tools" />
       </div>
     </div>
-  </div>
+
+    <!-- 热力图区域 -->
+    <div class="relative z-10 px-5 pb-2 sm:px-8">
+      <div class="mb-2 flex items-center justify-between">
+        <span class="text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500">
+          Activity Heatmap
+        </span>
+      </div>
+      <div class="overflow-x-auto overflow-y-hidden scrollbar-hide py-1">
+        <div ref="chartRef" class="h-[140px] min-w-[700px] lg:w-full" />
+      </div>
+    </div>
+
+    <!-- 关键指标卡片 -->
+    <OverviewStatCards
+      flat
+      :daily-avg-messages="dailyAvgMessages"
+      :duration-days="durationDays"
+      :image-count="imageCount"
+      :peak-hour="peakHour"
+      :peak-weekday="peakWeekday"
+      :weekday-names="weekdayNames"
+      :weekday-vs-weekend="weekdayVsWeekend"
+      :peak-day="peakDay"
+      :active-days="activeDays"
+      :total-days="totalDays"
+      :active-rate="activeRate"
+      :late-night-count="lateNightChat.count"
+      :late-night-ratio="lateNightChat.ratio"
+      :max-consecutive-days="maxConsecutiveDays"
+    />
+  </ReportCard>
 </template>

@@ -1,11 +1,17 @@
 /**
  * 技能管理 Store
- * 管理技能列表缓存、当前激活技能、配置 CRUD、内置技能目录
+ * 管理技能列表缓存、当前激活技能、配置 CRUD、云端市场
  */
 
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { useAssistantStore } from './assistant'
+import { usePlatformService, useSkillService } from '@/services'
+import { CHART_CAPABILITY_SKILL_ID } from '@openchatlab/core'
+
+import { CHATLAB_SITE_BASE } from '@/utils/chatlabSiteLocale'
+const CLOUD_MARKET_BASE_URL = CHATLAB_SITE_BASE
+const LOCALE_PATH_MAP: Record<string, string> = { 'zh-CN': 'cn', 'zh-TW': 'cn', 'en-US': 'en', 'ja-JP': 'ja' }
 
 export interface SkillSummary {
   id: string
@@ -33,40 +39,70 @@ export interface BuiltinSkillInfo extends SkillSummary {
   hasUpdate: boolean
 }
 
+export interface CloudSkillItem {
+  id: string
+  name: string
+  description: string
+  chatScope: 'all' | 'group' | 'private'
+  tags: string[]
+  path: string
+}
+
 export const useSkillStore = defineStore('skill', () => {
   const skills = ref<SkillSummary[]>([])
   const activeSkillId = ref<string | null>(null)
-  const builtinCatalog = ref<BuiltinSkillInfo[]>([])
   const isLoaded = ref(false)
 
+  /** @deprecated 本地内置目录已清空，保留兼容 */
+  const builtinCatalog = ref<BuiltinSkillInfo[]>([])
+
+  /** 云端市场目录 */
+  const cloudCatalog = ref<CloudSkillItem[]>([])
+  const cloudLoading = ref(false)
+  const cloudError = ref<string | null>(null)
+
   const currentChatType = ref<'group' | 'private'>('group')
+  const currentLocale = ref<string>('zh-CN')
+
+  function getChartCapabilitySkillSummary(): SkillSummary {
+    const isZh = currentLocale.value.startsWith('zh')
+    return {
+      id: CHART_CAPABILITY_SKILL_ID,
+      name: isZh ? '绘图助手' : 'Chart Assistant',
+      description: isZh ? '按本轮问题生成灵活的聊天数据图表' : 'Generate flexible charts for this chat question',
+      tags: [isZh ? '图表' : 'chart'],
+      chatScope: 'all',
+      tools: ['render_chart', 'get_schema'],
+      builtinId: CHART_CAPABILITY_SKILL_ID,
+    }
+  }
 
   const activeSkill = computed(() => {
     if (!activeSkillId.value) return null
+    if (activeSkillId.value === CHART_CAPABILITY_SKILL_ID) {
+      return getChartCapabilitySkillSummary()
+    }
     return skills.value.find((s) => s.id === activeSkillId.value) ?? null
   })
 
-  /** 按 chatScope 过滤：'all' 或匹配当前 chatType */
+  const chartCapabilitySkill = computed(() => getChartCapabilitySkillSummary())
+
   const scopedSkills = computed(() => {
     return skills.value.filter((s) => s.chatScope === 'all' || s.chatScope === currentChatType.value)
   })
 
-  /** 在 scopedSkills 基础上按助手工具权限过滤 */
   const compatibleSkills = computed(() => {
     const assistantStore = useAssistantStore()
     const config = assistantStore.selectedAssistant
-    if (!config) return scopedSkills.value
+    const baseSkills = [chartCapabilitySkill.value, ...scopedSkills.value]
+    if (!config) return baseSkills
 
-    return scopedSkills.value.filter((s) => {
+    return baseSkills.filter((s) => {
       if (!s.tools.length) return true
-      // 需要对当前助手的 allowedBuiltinTools 做兼容检查
-      // 但 AssistantSummary 不含 allowedBuiltinTools，所以这里不做严格过滤
-      // 严格兼容检查在后端 getSkillMenu 中完成
       return true
     })
   })
 
-  /** 按 tags 分组 */
   const groupedSkills = computed(() => {
     const groups: Record<string, SkillSummary[]> = {}
     for (const skill of compatibleSkills.value) {
@@ -77,34 +113,111 @@ export const useSkillStore = defineStore('skill', () => {
     return groups
   })
 
-  function setFilterContext(chatType: 'group' | 'private'): void {
+  /** 云端目录中标注导入状态 */
+  const cloudCatalogWithStatus = computed(() => {
+    const localIds = new Set(skills.value.map((s) => s.id))
+    return cloudCatalog.value.map((item) => ({
+      ...item,
+      imported: localIds.has(item.id),
+    }))
+  })
+
+  function setFilterContext(chatType: 'group' | 'private', locale?: string): void {
     currentChatType.value = chatType
+    if (locale) currentLocale.value = locale
   }
 
   async function loadSkills(): Promise<void> {
     try {
-      skills.value = await window.skillApi.getAll()
+      skills.value = await useSkillService().getAll()
       isLoaded.value = true
     } catch (error) {
       console.error('[SkillStore] Failed to load skills:', error)
     }
   }
 
+  /** @deprecated 本地内置目录已清空，保留兼容 */
   async function loadBuiltinCatalog(): Promise<void> {
     try {
-      builtinCatalog.value = await window.skillApi.getBuiltinCatalog()
+      builtinCatalog.value = await useSkillService().getBuiltinCatalog()
     } catch (error) {
       console.error('[SkillStore] Failed to load builtin catalog:', error)
     }
   }
+
+  // ==================== 云端市场 ====================
+
+  async function fetchCloudCatalog(): Promise<void> {
+    const langPath = LOCALE_PATH_MAP[currentLocale.value] ?? 'en'
+    const url = `${CLOUD_MARKET_BASE_URL}/${langPath}/skill.json`
+
+    cloudLoading.value = true
+    cloudError.value = null
+
+    try {
+      const result = await usePlatformService().fetchRemoteConfig(url)
+      if (!result.success || !result.data) {
+        cloudError.value = result.error || 'Failed to fetch cloud catalog'
+        cloudCatalog.value = []
+        return
+      }
+
+      const data = result.data as CloudSkillItem[]
+      if (!Array.isArray(data)) {
+        cloudError.value = 'Invalid catalog format'
+        cloudCatalog.value = []
+        return
+      }
+
+      cloudCatalog.value = data.filter((item) => item.id && item.name && item.path)
+    } catch (error) {
+      cloudError.value = String(error)
+      cloudCatalog.value = []
+    } finally {
+      cloudLoading.value = false
+    }
+  }
+
+  async function importFromCloud(item: CloudSkillItem): Promise<{ success: boolean; error?: string }> {
+    const mdUrl = `${CLOUD_MARKET_BASE_URL}${item.path}`
+
+    try {
+      const mdResult = await usePlatformService().fetchRemoteConfig(mdUrl)
+      if (!mdResult.success || typeof mdResult.data !== 'string') {
+        return { success: false, error: mdResult.error || 'Failed to fetch skill content' }
+      }
+
+      const result = await useSkillService().importFromMd(mdResult.data)
+      if (result.success) {
+        await loadSkills()
+      }
+      return result
+    } catch (error) {
+      return { success: false, error: String(error) }
+    }
+  }
+
+  function isCloudItemImported(id: string): boolean {
+    return skills.value.some((s) => s.id === id)
+  }
+
+  // ==================== 基础 CRUD ====================
 
   function activateSkill(id: string | null): void {
     activeSkillId.value = id
   }
 
   async function getSkillConfig(id: string): Promise<SkillConfigFull | null> {
+    if (id === CHART_CAPABILITY_SKILL_ID) {
+      const skill = getChartCapabilitySkillSummary()
+      return {
+        ...skill,
+        prompt: '',
+        builtinId: CHART_CAPABILITY_SKILL_ID,
+      }
+    }
     try {
-      return await window.skillApi.getConfig(id)
+      return await useSkillService().getConfig(id)
     } catch (error) {
       console.error('[SkillStore] Failed to get skill config:', error)
       return null
@@ -113,10 +226,8 @@ export const useSkillStore = defineStore('skill', () => {
 
   async function updateSkill(id: string, rawMd: string): Promise<{ success: boolean; error?: string }> {
     try {
-      const result = await window.skillApi.update(id, rawMd)
-      if (result.success) {
-        await loadSkills()
-      }
+      const result = await useSkillService().update(id, rawMd)
+      if (result.success) await loadSkills()
       return result
     } catch (error) {
       return { success: false, error: String(error) }
@@ -125,10 +236,8 @@ export const useSkillStore = defineStore('skill', () => {
 
   async function createSkill(rawMd: string): Promise<{ success: boolean; id?: string; error?: string }> {
     try {
-      const result = await window.skillApi.create(rawMd)
-      if (result.success) {
-        await loadSkills()
-      }
+      const result = await useSkillService().create(rawMd)
+      if (result.success) await loadSkills()
       return result
     } catch (error) {
       return { success: false, error: String(error) }
@@ -137,13 +246,10 @@ export const useSkillStore = defineStore('skill', () => {
 
   async function deleteSkill(id: string): Promise<{ success: boolean; error?: string }> {
     try {
-      const result = await window.skillApi.delete(id)
+      const result = await useSkillService().delete(id)
       if (result.success) {
-        if (activeSkillId.value === id) {
-          activeSkillId.value = null
-        }
+        if (activeSkillId.value === id) activeSkillId.value = null
         await loadSkills()
-        await loadBuiltinCatalog()
       }
       return result
     } catch (error) {
@@ -153,7 +259,7 @@ export const useSkillStore = defineStore('skill', () => {
 
   async function importSkill(builtinId: string): Promise<{ success: boolean; id?: string; error?: string }> {
     try {
-      const result = await window.skillApi.importSkill(builtinId)
+      const result = await useSkillService().importBuiltin(builtinId)
       if (result.success) {
         await loadSkills()
         await loadBuiltinCatalog()
@@ -166,7 +272,7 @@ export const useSkillStore = defineStore('skill', () => {
 
   async function reimportSkill(id: string): Promise<{ success: boolean; error?: string }> {
     try {
-      const result = await window.skillApi.reimportSkill(id)
+      const result = await useSkillService().reimport(id)
       if (result.success) {
         await loadSkills()
         await loadBuiltinCatalog()
@@ -183,13 +289,21 @@ export const useSkillStore = defineStore('skill', () => {
     builtinCatalog,
     isLoaded,
     currentChatType,
+    currentLocale,
     activeSkill,
     scopedSkills,
     compatibleSkills,
     groupedSkills,
+    cloudCatalog,
+    cloudLoading,
+    cloudError,
+    cloudCatalogWithStatus,
     setFilterContext,
     loadSkills,
     loadBuiltinCatalog,
+    fetchCloudCatalog,
+    importFromCloud,
+    isCloudItemImported,
     activateSkill,
     getSkillConfig,
     updateSkill,

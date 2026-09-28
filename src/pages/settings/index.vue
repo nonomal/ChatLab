@@ -3,11 +3,12 @@ import { ref, watch, onMounted, computed, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import PageHeader from '@/components/layout/PageHeader.vue'
-import AISettingsTab from './components/AISettingsTab.vue'
-import BasicSettingsTab from './components/BasicSettingsTab.vue'
-import BatchManageTab from './components/BatchManageTab.vue'
-import StorageTab from './components/StorageTab.vue'
-import AboutTab from './components/AboutTab.vue'
+import AISettingsTab from '@/components/common/Settings/AISettingsTab.vue'
+import BasicSettingsTab from '@/components/common/Settings/BasicSettingsTab.vue'
+import BatchManageTab from '@/components/common/Settings/BatchManageTab.vue'
+import StorageTab from '@/components/common/Settings/StorageTab.vue'
+import AboutTab from '@/components/common/Settings/AboutTab.vue'
+import ApiSettingsTab from '@/components/common/Settings/ApiSettingsTab.vue'
 import { usePromptStore } from '@/stores/prompt'
 
 const { t } = useI18n()
@@ -24,6 +25,7 @@ const tabs = computed(() => [
   { id: 'settings', label: t('settings.tabs.basic'), icon: 'i-heroicons-cog-6-tooth' },
   { id: 'ai', label: t('settings.tabs.ai'), icon: 'i-heroicons-sparkles' },
   { id: 'data', label: t('settings.tabs.dataManage'), icon: 'i-heroicons-rectangle-stack' },
+  { id: 'api', label: t('settings.tabs.api'), icon: 'i-heroicons-server-stack' },
   { id: 'storage', label: t('settings.tabs.storage'), icon: 'i-heroicons-folder-open' },
   { id: 'about', label: t('settings.tabs.about'), icon: 'i-heroicons-information-circle' },
 ])
@@ -83,7 +85,7 @@ onMounted(async () => {
 </script>
 
 <template>
-  <div class="flex h-full flex-col bg-white dark:bg-gray-900" style="padding-top: var(--titlebar-area-height)">
+  <div class="flex h-full flex-col bg-white dark:bg-page-dark" style="padding-top: var(--titlebar-area-height)">
     <PageHeader
       :title="t('settings.title')"
       icon="i-heroicons-cog-6-tooth"
@@ -117,7 +119,12 @@ onMounted(async () => {
             :ref="(el) => setTabRef('ai', el)"
             @config-changed="handleAIConfigChanged"
           />
-          <BatchManageTab v-else-if="activeTab === 'data'" key="data" />
+          <BatchManageTab
+            v-else-if="activeTab === 'data'"
+            key="data"
+            :focus-owner-issues="route.query.subTab === 'missing-owner'"
+          />
+          <ApiSettingsTab v-else-if="activeTab === 'api'" key="api" />
           <StorageTab v-else-if="activeTab === 'storage'" key="storage" :ref="(el) => setTabRef('storage', el)" />
           <AboutTab v-else-if="activeTab === 'about'" key="about" />
         </Transition>

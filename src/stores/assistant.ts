@@ -1,67 +1,49 @@
 /**
  * 助手管理 Store
- * 管理助手列表缓存、当前选中助手、配置 CRUD、内置助手目录
+ * 管理助手列表缓存、当前选中助手、配置 CRUD、云端市场
  */
 
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { i18n } from '@/i18n'
+import { usePlatformService, useAssistantService, usePreferencesService } from '@/services'
+import {
+  getDefaultGeneralAssistantId,
+  type AssistantConfig,
+  type AssistantSummary,
+  type AssistantUpgradeInfo,
+  type AssistantUpgradeResult,
+} from '@openchatlab/shared-types'
 
-export interface AssistantSummary {
+import { CHATLAB_SITE_BASE } from '@/utils/chatlabSiteLocale'
+const CLOUD_MARKET_BASE_URL = CHATLAB_SITE_BASE
+const LOCALE_PATH_MAP: Record<string, string> = { 'zh-CN': 'cn', 'zh-TW': 'cn', 'en-US': 'en', 'ja-JP': 'ja' }
+
+export type { AssistantSummary } from '@openchatlab/shared-types'
+export type AssistantConfigFull = AssistantConfig
+
+export interface CloudAssistantItem {
   id: string
-  name: string
-  systemPrompt: string
-  presetQuestions: string[]
-  order?: number
-  builtinId?: string
-  applicableChatTypes?: ('group' | 'private')[]
-  supportedLocales?: string[]
-}
-
-export interface AssistantConfigFull {
-  id: string
-  name: string
-  systemPrompt: string
-  presetQuestions: string[]
-  allowedBuiltinTools?: string[]
-  customSqlTools?: unknown[]
-  version: number
-  builtinId?: string
-  order?: number
-  applicableChatTypes?: ('group' | 'private')[]
-  supportedLocales?: string[]
-}
-
-export interface BuiltinAssistantInfo {
-  id: string
-  name: string
-  systemPrompt: string
-  version: number
-  order?: number
-  applicableChatTypes?: ('group' | 'private')[]
-  supportedLocales?: string[]
-  imported: boolean
-  hasUpdate: boolean
-}
-
-export interface BuiltinSqlToolInfo {
   name: string
   description: string
+  applicableChatTypes: ('group' | 'private')[]
+  path: string
 }
 
 export const useAssistantStore = defineStore('assistant', () => {
   const assistants = ref<AssistantSummary[]>([])
   const selectedAssistantId = ref<string | null>(null)
   const isLoaded = ref(false)
+  const checkedUpgradeAssistantIds = new Set<string>()
+  let assistantUpgradeSkippedVersions: Record<string, number> | null = null
 
-  /** 内置助手模板目录（助手市场数据源） */
-  const builtinCatalog = ref<BuiltinAssistantInfo[]>([])
+  /** 内置工具目录（含分类） */
+  const builtinToolCatalog = ref<Array<{ name: string; category: 'core' | 'analysis' }>>([])
 
-  /** 内置 SQL 工具目录 */
-  const builtinSqlTools = ref<BuiltinSqlToolInfo[]>([])
-
-  /** 内置 TS 工具名称列表 */
-  const builtinTsToolNames = ref<string[]>([])
+  /** 云端市场目录 */
+  const cloudCatalog = ref<CloudAssistantItem[]>([])
+  const cloudLoading = ref(false)
+  const cloudError = ref<string | null>(null)
 
   /** 当前过滤条件 */
   const currentChatType = ref<'group' | 'private'>('group')
@@ -72,7 +54,6 @@ export const useAssistantStore = defineStore('assistant', () => {
     return assistants.value.find((a) => a.id === selectedAssistantId.value) ?? null
   })
 
-  /** 根据聊天类型和语言过滤后的助手列表（导入的 = 全部可用的） */
   const filteredAssistants = computed(() => {
     return assistants.value.filter((a) => {
       const typeMatch = !a.applicableChatTypes?.length || a.applicableChatTypes.includes(currentChatType.value)
@@ -90,6 +71,15 @@ export const useAssistantStore = defineStore('assistant', () => {
 
   const hasMoreAssistants = computed(() => filteredAssistants.value.length > defaultVisibleCount)
 
+  /** 云端目录中标注导入状态 */
+  const cloudCatalogWithStatus = computed(() => {
+    const localIds = new Set(assistants.value.map((a) => a.id))
+    return cloudCatalog.value.map((item) => ({
+      ...item,
+      imported: localIds.has(item.id),
+    }))
+  })
+
   function setFilterContext(chatType: 'group' | 'private', locale: string): void {
     currentChatType.value = chatType
     currentLocale.value = locale
@@ -97,36 +87,80 @@ export const useAssistantStore = defineStore('assistant', () => {
 
   async function loadAssistants(): Promise<void> {
     try {
-      assistants.value = await window.assistantApi.getAll()
+      const svc = useAssistantService()
+      assistants.value = await svc.getAll()
       isLoaded.value = true
     } catch (error) {
       console.error('[AssistantStore] Failed to load assistants:', error)
     }
   }
 
-  async function loadBuiltinCatalog(): Promise<void> {
+  async function loadBuiltinToolCatalog(): Promise<void> {
     try {
-      builtinCatalog.value = await window.assistantApi.getBuiltinCatalog()
+      builtinToolCatalog.value = await useAssistantService().getBuiltinToolCatalog()
     } catch (error) {
-      console.error('[AssistantStore] Failed to load builtin catalog:', error)
+      console.error('[AssistantStore] Failed to load builtin tool catalog:', error)
     }
   }
 
-  async function loadBuiltinSqlTools(): Promise<void> {
+  // ==================== 云端市场 ====================
+
+  async function fetchCloudCatalog(localeOverride?: string): Promise<void> {
+    // 助手市场请求只依赖 locale，不应该反向修改选择页的筛选上下文。
+    const langPath = LOCALE_PATH_MAP[localeOverride || currentLocale.value] ?? 'en'
+    const url = `${CLOUD_MARKET_BASE_URL}/${langPath}/assistant.json`
+
+    cloudLoading.value = true
+    cloudError.value = null
+
     try {
-      builtinSqlTools.value = await window.assistantApi.getBuiltinSqlTools()
+      const result = await usePlatformService().fetchRemoteConfig(url)
+      if (!result.success || !result.data) {
+        cloudError.value = result.error || 'Failed to fetch cloud catalog'
+        cloudCatalog.value = []
+        return
+      }
+
+      const data = result.data as CloudAssistantItem[]
+      if (!Array.isArray(data)) {
+        cloudError.value = 'Invalid catalog format'
+        cloudCatalog.value = []
+        return
+      }
+
+      cloudCatalog.value = data.filter((item) => item.id && item.name && item.path)
     } catch (error) {
-      console.error('[AssistantStore] Failed to load builtin sql tools:', error)
+      cloudError.value = String(error)
+      cloudCatalog.value = []
+    } finally {
+      cloudLoading.value = false
     }
   }
 
-  async function loadBuiltinTsToolNames(): Promise<void> {
+  async function importFromCloud(item: CloudAssistantItem): Promise<{ success: boolean; error?: string }> {
+    const mdUrl = `${CLOUD_MARKET_BASE_URL}${item.path}`
+
     try {
-      builtinTsToolNames.value = await window.assistantApi.getBuiltinTsToolNames()
+      const mdResult = await usePlatformService().fetchRemoteConfig(mdUrl)
+      if (!mdResult.success || typeof mdResult.data !== 'string') {
+        return { success: false, error: mdResult.error || 'Failed to fetch assistant content' }
+      }
+
+      const result = await useAssistantService().importFromMd(mdResult.data)
+      if (result.success) {
+        await loadAssistants()
+      }
+      return result
     } catch (error) {
-      console.error('[AssistantStore] Failed to load builtin ts tool names:', error)
+      return { success: false, error: String(error) }
     }
   }
+
+  function isCloudItemImported(id: string): boolean {
+    return assistants.value.some((a) => a.id === id)
+  }
+
+  // ==================== 基础 CRUD ====================
 
   function selectAssistant(id: string): void {
     selectedAssistantId.value = id
@@ -138,7 +172,7 @@ export const useAssistantStore = defineStore('assistant', () => {
 
   async function getAssistantConfig(id: string): Promise<AssistantConfigFull | null> {
     try {
-      return await window.assistantApi.getConfig(id)
+      return await useAssistantService().getConfig(id)
     } catch (error) {
       console.error('[AssistantStore] Failed to get config:', error)
       return null
@@ -150,10 +184,8 @@ export const useAssistantStore = defineStore('assistant', () => {
     updates: Partial<AssistantConfigFull>
   ): Promise<{ success: boolean; error?: string }> {
     try {
-      const result = await window.assistantApi.update(id, updates)
-      if (result.success) {
-        await loadAssistants()
-      }
+      const result = await useAssistantService().update(id, updates)
+      if (result.success) await loadAssistants()
       return result
     } catch (error) {
       return { success: false, error: String(error) }
@@ -162,36 +194,76 @@ export const useAssistantStore = defineStore('assistant', () => {
 
   async function resetAssistant(id: string): Promise<{ success: boolean; error?: string }> {
     try {
-      const result = await window.assistantApi.reset(id)
-      if (result.success) {
-        await loadAssistants()
-      }
+      const result = await useAssistantService().reset(id)
+      if (result.success) await loadAssistants()
       return result
     } catch (error) {
       return { success: false, error: String(error) }
     }
   }
 
-  async function importAssistant(builtinId: string): Promise<{ success: boolean; error?: string }> {
+  async function checkDefaultAssistantUpgrade(locale: string): Promise<AssistantUpgradeInfo | null> {
+    const assistantId = getDefaultGeneralAssistantId(locale)
+    if (checkedUpgradeAssistantIds.has(assistantId)) return null
+
+    // 同一默认助手每次启动只提示一次；请求失败时撤销标记，允许下次进入页面重试。
+    checkedUpgradeAssistantIds.add(assistantId)
     try {
-      const result = await window.assistantApi.importAssistant(builtinId)
-      if (result.success) {
-        await loadAssistants()
-        await loadBuiltinCatalog()
+      const info = await useAssistantService().getUpgradeInfo(assistantId)
+      if (!info) return null
+
+      try {
+        if (!assistantUpgradeSkippedVersions) {
+          const preferences = await usePreferencesService().getPreferences()
+          assistantUpgradeSkippedVersions = { ...preferences.assistantUpgradeSkippedVersions }
+        }
+        if (info.latestVersion !== null && assistantUpgradeSkippedVersions[info.builtinId] === info.latestVersion) {
+          return null
+        }
+      } catch (error) {
+        // 偏好读取失败时仍展示升级提示，避免把真实可用的升级静默吞掉。
+        console.error('[AssistantStore] Failed to load skipped assistant upgrades:', error)
       }
+
+      return info
+    } catch (error) {
+      checkedUpgradeAssistantIds.delete(assistantId)
+      console.error('[AssistantStore] Failed to check assistant upgrade:', error)
+      return null
+    }
+  }
+
+  async function skipAssistantUpgrade(info: AssistantUpgradeInfo): Promise<{ success: boolean; error?: string }> {
+    if (info.latestVersion === null) {
+      return { success: false, error: 'Assistant template version is unavailable' }
+    }
+
+    try {
+      if (!assistantUpgradeSkippedVersions) {
+        const preferences = await usePreferencesService().getPreferences()
+        assistantUpgradeSkippedVersions = { ...preferences.assistantUpgradeSkippedVersions }
+      }
+      const nextSkippedVersions = {
+        ...assistantUpgradeSkippedVersions,
+        [info.builtinId]: info.latestVersion,
+      }
+      const result = await usePreferencesService().savePreferences({
+        assistantUpgradeSkippedVersions: nextSkippedVersions,
+      })
+      if (result.success) assistantUpgradeSkippedVersions = nextSkippedVersions
       return result
     } catch (error) {
       return { success: false, error: String(error) }
     }
   }
 
-  async function reimportAssistant(id: string): Promise<{ success: boolean; error?: string }> {
+  async function upgradeAssistantWithBackup(
+    info: AssistantUpgradeInfo,
+    backupName: string
+  ): Promise<AssistantUpgradeResult> {
     try {
-      const result = await window.assistantApi.reimportAssistant(id)
-      if (result.success) {
-        await loadAssistants()
-        await loadBuiltinCatalog()
-      }
+      const result = await useAssistantService().upgradeWithBackup(info.assistantId, backupName)
+      if (result.success) await loadAssistants()
       return result
     } catch (error) {
       return { success: false, error: String(error) }
@@ -199,13 +271,11 @@ export const useAssistantStore = defineStore('assistant', () => {
   }
 
   async function createAssistant(
-    config: Omit<AssistantConfigFull, 'id' | 'version'>
+    config: Omit<AssistantConfigFull, 'id'>
   ): Promise<{ success: boolean; id?: string; error?: string }> {
     try {
-      const result = await window.assistantApi.create(config)
-      if (result.success) {
-        await loadAssistants()
-      }
+      const result = await useAssistantService().create(config)
+      if (result.success) await loadAssistants()
       return result
     } catch (error) {
       return { success: false, error: String(error) }
@@ -214,19 +284,15 @@ export const useAssistantStore = defineStore('assistant', () => {
 
   async function duplicateAssistant(id: string): Promise<{ success: boolean; error?: string }> {
     try {
-      const config = await window.assistantApi.getConfig(id)
-      if (!config) {
-        return { success: false, error: 'Assistant not found' }
-      }
-      const { id: _id, version: _ver, builtinId: _bid, ...rest } = config
-      const result = await window.assistantApi.create({
+      const svc = useAssistantService()
+      const config = await svc.getConfig(id)
+      if (!config) return { success: false, error: 'Assistant not found' }
+      const { id: _id, builtinId: _bid, ...rest } = config
+      const result = await svc.create({
         ...rest,
         name: `${config.name}${i18n.global.t('ai.assistant.duplicateSuffix')}`,
       })
-      if (result.success) {
-        await loadAssistants()
-        await loadBuiltinCatalog()
-      }
+      if (result.success) await loadAssistants()
       return result
     } catch (error) {
       return { success: false, error: String(error) }
@@ -235,11 +301,8 @@ export const useAssistantStore = defineStore('assistant', () => {
 
   async function deleteAssistant(id: string): Promise<{ success: boolean; error?: string }> {
     try {
-      const result = await window.assistantApi.delete(id)
-      if (result.success) {
-        await loadAssistants()
-        await loadBuiltinCatalog()
-      }
+      const result = await useAssistantService().delete(id)
+      if (result.success) await loadAssistants()
       return result
     } catch (error) {
       return { success: false, error: String(error) }
@@ -251,9 +314,11 @@ export const useAssistantStore = defineStore('assistant', () => {
     selectedAssistantId,
     selectedAssistant,
     isLoaded,
-    builtinCatalog,
-    builtinSqlTools,
-    builtinTsToolNames,
+    builtinToolCatalog,
+    cloudCatalog,
+    cloudLoading,
+    cloudError,
+    cloudCatalogWithStatus,
     currentChatType,
     currentLocale,
     filteredAssistants,
@@ -261,9 +326,10 @@ export const useAssistantStore = defineStore('assistant', () => {
     moreAssistants,
     hasMoreAssistants,
     loadAssistants,
-    loadBuiltinCatalog,
-    loadBuiltinSqlTools,
-    loadBuiltinTsToolNames,
+    loadBuiltinToolCatalog,
+    fetchCloudCatalog,
+    importFromCloud,
+    isCloudItemImported,
     selectAssistant,
     clearSelection,
     setFilterContext,
@@ -272,8 +338,9 @@ export const useAssistantStore = defineStore('assistant', () => {
     createAssistant,
     duplicateAssistant,
     resetAssistant,
-    importAssistant,
-    reimportAssistant,
+    checkDefaultAssistantUpgrade,
+    skipAssistantUpgrade,
+    upgradeAssistantWithBackup,
     deleteAssistant,
   }
 })

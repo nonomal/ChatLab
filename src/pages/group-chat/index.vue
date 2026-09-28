@@ -1,25 +1,29 @@
 <script setup lang="ts">
-import { ref, onMounted, watch, computed } from 'vue'
+import { ref, computed, defineAsyncComponent, provide } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { useI18n } from 'vue-i18n'
-import type { AnalysisSession, MessageType } from '@/types/base'
-import type { MemberActivity, HourlyActivity, DailyActivity } from '@/types/analysis'
-import CaptureButton from '@/components/common/CaptureButton.vue'
-import TimeSelect from '@/components/common/TimeSelect.vue'
-import AITab from '@/components/analysis/AITab.vue'
-import OverviewTab from './components/OverviewTab.vue'
-import ViewTab from './components/ViewTab.vue'
-import QuotesTab from './components/QuotesTab.vue'
-import MemberTab from './components/MemberTab.vue'
-import PageHeader from '@/components/layout/PageHeader.vue'
-import SessionIndexModal from '@/components/analysis/SessionIndexModal.vue'
+import MoreTab from '@/components/analysis/MoreTab.vue'
+import MemoryTab from '@/components/analysis/MemoryTab.vue'
+import { ChatExplorer } from '@/components/AIChat'
+import GroupChatInsights from './components/insights/GroupChatInsights.vue'
+import RankingView from '@/components/analysis/ranking/RankingView.vue'
+import MemberList from '@/components/common/member/MemberList.vue'
+import NicknameHistoryEntry from './components/member/NicknameHistoryEntry.vue'
+import SessionAnalysisHeader from '@/components/layout/session/SessionAnalysisHeader.vue'
+import SidePanelLayout from '@/components/layout/SidePanelLayout.vue'
+import SemanticIndexSessionModal from '@/components/analysis/SemanticIndexSessionModal.vue'
+import OwnerPromptModal from '@/components/analysis/member/OwnerPromptModal.vue'
 import IncrementalImportModal from '@/components/analysis/IncrementalImportModal.vue'
-import MessageExportModal from '@/components/MessageExport/MessageExportModal.vue'
-import LoadingState from '@/components/UI/LoadingState.vue'
+const MessageExportModal = defineAsyncComponent(() => import('@/components/MessageExport/MessageExportModal.vue'))
+import ActionToolsPanel from '@/components/layout/ActionToolsPanel.vue'
+import { LoadingDots, LoadingState } from '@/components/UI'
 import { useSessionStore } from '@/stores/session'
 import { useLayoutStore } from '@/stores/layout'
-import { useTimeSelect } from '@/composables'
+import { useSettingsStore } from '@/stores/settings'
+import { useSessionAnalysisPageBase } from '@/composables'
+import { useInsightTabAnalytics } from '@/composables/useInsightTabAnalytics'
+import { IS_WEB_WASM } from '@/utils/platform'
 
 const { t } = useI18n()
 
@@ -27,10 +31,13 @@ const route = useRoute()
 const router = useRouter()
 const sessionStore = useSessionStore()
 const layoutStore = useLayoutStore()
+const settingsStore = useSettingsStore()
 const { currentSessionId } = storeToRefs(sessionStore)
 
-// 会话索引弹窗状态
-const showSessionIndexModal = ref(false)
+const showSemanticIndexModal = ref(false)
+
+// "我是谁"提示弹窗状态
+const showOwnerPromptModal = ref(false)
 
 // 增量导入弹窗状态
 const showIncrementalImportModal = ref(false)
@@ -38,48 +45,57 @@ const showIncrementalImportModal = ref(false)
 // 导出聊天记录弹窗状态
 const showMessageExportModal = ref(false)
 
+// 成员管理弹窗状态
+const showMemberManagementModal = ref(false)
+
 // 打开聊天记录查看器
 function openChatRecordViewer() {
-  layoutStore.openChatRecordDrawer({})
+  layoutStore.openChatRecords({})
 }
 
-// 数据状态
-const isLoading = ref(true)
-const session = ref<AnalysisSession | null>(null)
-const memberActivity = ref<MemberActivity[]>([])
-const hourlyActivity = ref<HourlyActivity[]>([])
-const dailyActivity = ref<DailyActivity[]>([])
-const messageTypes = ref<Array<{ type: MessageType; count: number }>>([])
-const isInitialLoad = ref(true)
-
 // Tab 配置
-const allTabs = [
-  { id: 'overview', labelKey: 'analysis.tabs.overview', icon: 'i-heroicons-chart-pie' },
-  { id: 'view', labelKey: 'analysis.tabs.view', icon: 'i-heroicons-presentation-chart-bar' },
-  { id: 'quotes', labelKey: 'analysis.tabs.groupQuotes', icon: 'i-heroicons-chat-bubble-bottom-center-text' },
-  { id: 'members', labelKey: 'analysis.tabs.members', icon: 'i-heroicons-user-group' },
-  { id: 'ai', labelKey: 'analysis.tabs.ai', icon: 'i-heroicons-sparkles' },
+const tabs = [
+  { id: 'insights', labelKey: 'analysis.tabs.insights', icon: 'i-heroicons-presentation-chart-bar' },
+  { id: 'ranking', labelKey: 'analysis.tabs.ranking', icon: 'i-heroicons-trophy' },
+  { id: 'ai-chat', labelKey: 'analysis.tabs.aiChat', icon: 'i-heroicons-chat-bubble-left-ellipsis' },
+  { id: 'memory', labelKey: 'analysis.tabs.memory', icon: 'i-heroicons-light-bulb' },
+  { id: 'more', labelKey: 'analysis.tabs.more', icon: 'i-heroicons-squares-2x2' },
 ]
 
-// Tab 列表
-const tabs = computed(() => allTabs)
+const {
+  activeTab,
+  isLoading,
+  isInitialLoad,
+  isSessionSwitching,
+  session,
+  memberActivity,
+  hourlyActivity,
+  dailyActivity,
+  messageTypes,
+  timeRangeValue,
+  fullTimeRange,
+  availableYears,
+  timeFilter,
+  initialTimeState,
+  loadData,
+  invalidateAnalysisData,
+  handleTimeRangeInitialized,
+} = useSessionAnalysisPageBase({
+  route,
+  router,
+  currentSessionId,
+  selectSession: sessionStore.selectSession,
+  defaultTab: settingsStore.defaultSessionTab,
+  validTabIds: tabs.map((tab) => tab.id),
+})
 
-const activeTab = ref((route.query.tab as string) || 'overview')
+provide('session-switch-loading', isSessionSwitching)
 
-// 时间范围筛选（composable 统一管理状态、派生计算、URL 同步）
-const { timeRangeValue, fullTimeRange, availableYears, timeFilter, selectedYearForOverview, initialTimeState } =
-  useTimeSelect(route, router, {
-    activeTab,
-    isInitialLoad,
-    currentSessionId,
-    onTimeRangeChange: () => loadAnalysisData(),
-  })
-
-// 计算属性
-const topMembers = computed(() => memberActivity.value.slice(0, 3))
-const bottomMembers = computed(() => {
-  if (memberActivity.value.length <= 1) return []
-  return [...memberActivity.value].sort((a, b) => a.messageCount - b.messageCount).slice(0, 1)
+const trackInsightTab = useInsightTabAnalytics({
+  chatType: 'group',
+  isActive: () => activeTab.value === 'insights' && !isSessionSwitching.value,
+  sessionId: currentSessionId,
+  routePath: () => route.path,
 })
 
 // 当前筛选后的消息总数
@@ -91,225 +107,128 @@ const filteredMessageCount = computed(() => {
 const filteredMemberCount = computed(() => {
   return memberActivity.value.filter((m) => m.messageCount > 0).length
 })
-
-// Sync route param to store
-function syncSession() {
-  const id = route.params.id as string
-  if (id) {
-    sessionStore.selectSession(id)
-    // If selection failed (e.g. invalid ID), redirect to home
-    if (sessionStore.currentSessionId !== id) {
-      router.replace('/')
-    }
-  }
-}
-
-// 加载基础数据（仅会话信息，时间范围由 TimeSelect 内部拉取）
-async function loadBaseData() {
-  if (!currentSessionId.value) return
-
-  try {
-    const sessionData = await window.chatApi.getSession(currentSessionId.value)
-    session.value = sessionData
-  } catch (error) {
-    console.error('加载基础数据失败:', error)
-  }
-}
-
-// 加载分析数据（受年份筛选影响）
-async function loadAnalysisData() {
-  if (!currentSessionId.value) return
-
-  isLoading.value = true
-
-  try {
-    const filter = timeFilter.value
-
-    const [members, hourly, daily, types] = await Promise.all([
-      window.chatApi.getMemberActivity(currentSessionId.value, filter),
-      window.chatApi.getHourlyActivity(currentSessionId.value, filter),
-      window.chatApi.getDailyActivity(currentSessionId.value, filter),
-      window.chatApi.getMessageTypeDistribution(currentSessionId.value, filter),
-    ])
-
-    memberActivity.value = members
-    hourlyActivity.value = hourly
-    dailyActivity.value = daily
-    messageTypes.value = types
-  } catch (error) {
-    console.error('加载分析数据失败:', error)
-  } finally {
-    isLoading.value = false
-  }
-}
-
-// 加载所有数据
-async function loadData() {
-  if (!currentSessionId.value) return
-
-  isInitialLoad.value = true
-  await loadBaseData()
-  isInitialLoad.value = false
-}
-
-// 监听路由参数变化
-watch(
-  () => route.params.id,
-  () => {
-    // 切换会话时，重置 activeTab 为默认值（如果 URL 中没有 tab 参数）
-    // 注意：sidebar 导航通常会 push 新的 URL，不带 query 参数，所以这里会自动重置
-    // 但为了保险，我们可以在这里强制重置，或者依赖 activeTab 的初始化逻辑（它只在组件创建时初始化）
-    // 由于组件是复用的，我们需要手动处理
-    if (!route.query.tab) {
-      activeTab.value = 'overview'
-    } else {
-      activeTab.value = route.query.tab as string
-    }
-    syncSession()
-  }
-)
-
-// 监听会话变化（切换会话时由 TimeSelect 自行发出新范围，避免 Tab Content 双重重建）
-watch(
-  currentSessionId,
-  () => {
-    loadData()
-  },
-  { immediate: true }
-)
-
-onMounted(() => {
-  syncSession()
-})
 </script>
 
 <template>
-  <div class="flex h-full flex-col bg-white dark:bg-gray-900" style="padding-top: var(--titlebar-area-height)">
-    <!-- Loading State -->
-    <LoadingState v-if="isInitialLoad" variant="page" :text="t('analysis.groupChat.loading')" />
+  <div class="relative flex h-full flex-col dark:bg-page-dark" style="padding-top: var(--titlebar-area-height)">
+    <div
+      v-if="isSessionSwitching"
+      data-testid="group-chat-switch-loading"
+      class="absolute inset-0 z-20 flex cursor-wait items-center justify-center bg-page-bg dark:bg-page-dark"
+      :style="{ paddingTop: 'var(--titlebar-area-height)' }"
+      role="status"
+      aria-live="polite"
+      :aria-label="t('common.loading')"
+    >
+      <LoadingDots />
+    </div>
 
     <!-- Content -->
-    <template v-else-if="session">
-      <!-- Header -->
-      <PageHeader
+    <template v-if="session">
+      <SessionAnalysisHeader
+        v-model:active-tab="activeTab"
+        v-model:time-range-value="timeRangeValue"
         :title="session.name"
-        :description="
-          t('analysis.groupChat.description', {
-            dateRange: timeRangeValue?.displayLabel ?? '',
-            memberCount: timeRangeValue?.isFullRange !== false ? session.memberCount : filteredMemberCount,
-            messageCount: timeRangeValue?.isFullRange !== false ? session.messageCount : filteredMessageCount,
-          })
-        "
         :avatar="session.groupAvatar"
         icon="i-heroicons-chat-bubble-left-right"
         icon-class="bg-primary-600 text-white dark:bg-primary-500 dark:text-white"
+        :tabs="tabs"
+        :current-session-id="currentSessionId"
+        :initial-time-state="initialTimeState"
+        @open-incremental-import="showIncrementalImportModal = true"
+        @open-member-management="showMemberManagementModal = true"
+        @update:full-range="fullTimeRange = $event"
+        @update:available-years="availableYears = $event"
+        @time-range-initialized="handleTimeRangeInitialized"
+      />
+
+      <SidePanelLayout
+        :session-id="currentSessionId"
+        :default-view="activeTab === 'memory' && !IS_WEB_WASM ? 'topics' : 'records'"
       >
-        <template #actions>
-          <UButton
-            color="primary"
-            variant="soft"
-            size="sm"
-            icon="i-heroicons-chat-bubble-bottom-center-text"
-            @click="openChatRecordViewer"
-          >
-            {{ t('analysis.tooltip.chatViewer') }}
-          </UButton>
-          <CaptureButton />
-        </template>
-        <!-- Tabs -->
-        <div class="mt-4 flex items-center justify-between gap-4">
-          <div class="flex shrink-0 items-center gap-1 overflow-x-auto scrollbar-hide">
-            <button
-              v-for="tab in tabs"
-              :key="tab.id"
-              class="flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition-all"
-              :class="[
-                activeTab === tab.id
-                  ? 'bg-pink-500 text-white dark:bg-pink-900/30 dark:text-pink-300'
-                  : 'text-gray-600 hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-800',
-              ]"
-              @click="activeTab = tab.id"
-            >
-              <UIcon :name="tab.icon" class="h-4 w-4" />
-              <span class="whitespace-nowrap">{{ t(tab.labelKey) }}</span>
-            </button>
+        <!-- Tab Content -->
+        <div class="relative flex-1 overflow-y-auto">
+          <!-- Loading Overlay -->
+          <LoadingState v-if="isLoading && !isSessionSwitching" variant="overlay" :text="t('common.loading')" />
+
+          <div class="h-full">
+            <Transition name="tab-slide" mode="out-in">
+              <GroupChatInsights
+                v-if="activeTab === 'insights'"
+                :key="'insights-' + currentSessionId"
+                :session-id="currentSessionId!"
+                :session="session"
+                :member-activity="memberActivity"
+                :message-types="messageTypes"
+                :hourly-activity="hourlyActivity"
+                :daily-activity="dailyActivity"
+                :time-range="fullTimeRange"
+                :filtered-message-count="filteredMessageCount"
+                :filtered-member-count="filteredMemberCount"
+                :time-filter="timeFilter"
+                @select-tab="trackInsightTab"
+              />
+              <RankingView
+                v-else-if="activeTab === 'ranking'"
+                :key="'ranking-' + currentSessionId"
+                :session-id="currentSessionId!"
+                :time-filter="timeFilter"
+              />
+              <ChatExplorer
+                v-else-if="activeTab === 'ai-chat'"
+                :key="'ai-chat-' + currentSessionId"
+                :session-id="currentSessionId!"
+                :session-name="session.name"
+                chat-type="group"
+                :time-filter="timeFilter"
+              />
+              <MemoryTab
+                v-else-if="activeTab === 'memory'"
+                :key="'memory-' + currentSessionId"
+                :session-id="currentSessionId!"
+                :session-name="session.name"
+              />
+              <MoreTab
+                v-else-if="activeTab === 'more'"
+                :key="'more-' + currentSessionId"
+                :session-id="currentSessionId!"
+                chat-type="group"
+              />
+            </Transition>
           </div>
-          <!-- 时间范围选择器靠右（AI实验室时隐藏） -->
-          <TimeSelect
-            v-model="timeRangeValue"
-            :session-id="currentSessionId ?? undefined"
-            :visible="activeTab !== 'ai'"
-            :initial-state="initialTimeState"
-            @update:full-range="fullTimeRange = $event"
-            @update:available-years="availableYears = $event"
-          />
         </div>
-      </PageHeader>
+      </SidePanelLayout>
 
-      <!-- Tab Content -->
-      <div class="relative flex-1 overflow-y-auto">
-        <!-- Loading Overlay -->
-        <LoadingState v-if="isLoading" variant="overlay" />
-
-        <div class="h-full">
-          <Transition name="tab-slide" mode="out-in">
-            <OverviewTab
-              v-if="activeTab === 'overview'"
-              :key="'overview-' + currentSessionId"
-              :session="session"
-              :member-activity="memberActivity"
-              :top-members="topMembers"
-              :bottom-members="bottomMembers"
-              :message-types="messageTypes"
-              :hourly-activity="hourlyActivity"
-              :daily-activity="dailyActivity"
-              :time-range="fullTimeRange"
-              :selected-year="selectedYearForOverview"
-              :filtered-message-count="filteredMessageCount"
-              :filtered-member-count="filteredMemberCount"
-              :time-filter="timeFilter"
-              @open-session-index="showSessionIndexModal = true"
-              @open-incremental-import="showIncrementalImportModal = true"
-              @open-message-export="showMessageExportModal = true"
-            />
-            <ViewTab
-              v-else-if="activeTab === 'view'"
-              :key="'view-' + currentSessionId"
-              :session-id="currentSessionId!"
-              :time-filter="timeFilter"
-            />
-            <QuotesTab
-              v-else-if="activeTab === 'quotes'"
-              :key="'quotes-' + currentSessionId"
-              :session-id="currentSessionId!"
-              :time-filter="timeFilter"
-            />
-            <MemberTab
-              v-else-if="activeTab === 'members'"
-              :key="'members-' + currentSessionId"
-              :session-id="currentSessionId!"
-              :time-filter="timeFilter"
-              @data-changed="loadData"
-            />
-            <AITab
-              v-else-if="activeTab === 'ai'"
-              :key="'ai-' + currentSessionId"
-              :session-id="currentSessionId!"
-              :session-name="session.name"
-              chat-type="group"
-            />
-          </Transition>
-        </div>
-      </div>
+      <ActionToolsPanel
+        @open-incremental-import="showIncrementalImportModal = true"
+        @open-semantic-index="showSemanticIndexModal = true"
+        @open-member-management="showMemberManagementModal = true"
+        @open-chat-record="openChatRecordViewer"
+        @open-message-export="showMessageExportModal = true"
+      />
     </template>
 
     <!-- Empty State -->
-    <div v-else class="flex h-full items-center justify-center">
+    <div v-else-if="!isInitialLoad" class="flex h-full items-center justify-center">
       <p class="text-gray-500">{{ t('analysis.groupChat.loadError') }}</p>
     </div>
 
-    <!-- 会话索引弹窗（内部自动检测并弹出） -->
-    <SessionIndexModal v-if="currentSessionId" v-model="showSessionIndexModal" :session-id="currentSessionId" />
+    <!-- 语义索引弹窗（当前对话） -->
+    <SemanticIndexSessionModal
+      v-if="currentSessionId && session"
+      v-model="showSemanticIndexModal"
+      :session-id="currentSessionId"
+      :message-count="session.messageCount"
+    />
+
+    <!-- "我是谁"提示弹窗（内部自动检测并弹出） -->
+    <OwnerPromptModal
+      v-if="currentSessionId && session"
+      v-model="showOwnerPromptModal"
+      :session-id="currentSessionId"
+      chat-type="group"
+      auto-check
+    />
 
     <!-- 增量导入弹窗 -->
     <IncrementalImportModal
@@ -317,17 +236,60 @@ onMounted(() => {
       v-model="showIncrementalImportModal"
       :session-id="currentSessionId"
       :session-name="session.name"
-      @imported="loadData"
+      @imported="
+        () => {
+          loadData()
+          invalidateAnalysisData()
+          sessionStore.loadSessions()
+        }
+      "
     />
 
     <!-- 导出聊天记录弹窗 -->
     <MessageExportModal v-if="currentSessionId" v-model="showMessageExportModal" />
+
+    <!-- 成员管理弹窗 -->
+    <UModal v-if="currentSessionId" v-model:open="showMemberManagementModal" :ui="{ content: 'max-w-6xl h-[85vh]' }">
+      <template #content>
+        <div class="flex h-full flex-col overflow-hidden bg-white dark:bg-page-dark">
+          <div
+            class="flex flex-none items-center justify-between border-b border-gray-200 px-5 py-3 dark:border-gray-700"
+          >
+            <div>
+              <h2 class="text-lg font-semibold text-gray-900 dark:text-white">
+                {{ t('analysis.tooltip.memberManagement') }}
+              </h2>
+              <p class="text-sm text-gray-500 dark:text-gray-400">
+                {{ t('members.list.description', { count: session?.memberCount ?? 0 }) }}
+              </p>
+            </div>
+            <div class="flex items-center gap-2">
+              <NicknameHistoryEntry :session-id="currentSessionId" />
+              <UButton variant="ghost" icon="i-heroicons-x-mark" size="sm" @click="showMemberManagementModal = false" />
+            </div>
+          </div>
+          <div class="flex-1 overflow-hidden">
+            <MemberList
+              :session-id="currentSessionId"
+              :show-header="false"
+              chat-type="group"
+              @view-records="showMemberManagementModal = false"
+              @data-changed="
+                () => {
+                  loadData()
+                  invalidateAnalysisData()
+                }
+              "
+            />
+          </div>
+        </div>
+      </template>
+    </UModal>
   </div>
 </template>
 
 <style scoped>
-.tab-slide-enter-active,
-.tab-slide-leave-active {
+.tab-slide-enter-active {
   transition:
     opacity 0.2s ease,
     transform 0.2s ease;
@@ -336,10 +298,5 @@ onMounted(() => {
 .tab-slide-enter-from {
   opacity: 0;
   transform: translateY(10px);
-}
-
-.tab-slide-leave-to {
-  opacity: 0;
-  transform: translateY(-10px);
 }
 </style>

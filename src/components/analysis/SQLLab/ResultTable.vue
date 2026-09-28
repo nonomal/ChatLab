@@ -2,7 +2,7 @@
 import { ref, computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { storeToRefs } from 'pinia'
-import { useToast } from '@nuxt/ui/runtime/composables/useToast.js'
+import { useToast } from '@/composables/useToast'
 import MarkdownIt from 'markdown-it'
 import dayjs from 'dayjs'
 import type { SQLResult } from './types'
@@ -10,6 +10,9 @@ import { COLUMN_LABELS } from './types'
 import { usePromptStore } from '@/stores/prompt'
 import { useLayoutStore } from '@/stores/layout'
 import { exportSQLResult, type SQLExportFormat } from '@/utils/sqlExport'
+import { useLLMService } from '@/services'
+import { useCacheService } from '@/services/cache/service'
+import { useLlmStreamService } from '@/services/ai-stream/service'
 
 const { t, locale } = useI18n()
 const toast = useToast()
@@ -75,7 +78,7 @@ function getMessageIdColumnIndex(columns: string[]): number {
  * 查看消息上下文
  */
 function viewMessageContext(messageId: number) {
-  layoutStore.openChatRecordDrawer({
+  layoutStore.openChatRecords({
     scrollToMessageId: messageId,
   })
 }
@@ -240,36 +243,22 @@ async function exportResult() {
       toast.add({
         title: t('common.exportSuccess'),
         description: filename,
-        icon: 'i-heroicons-check-circle',
         color: 'primary',
-        duration: 3000,
         actions: [
           {
             label: t('common.openFolder'),
             onClick: () => {
-              window.cacheApi.showInFolder(result.filePath!)
+              useCacheService().showInFolder(result.filePath!)
             },
           },
         ],
       })
     } else {
-      toast.add({
-        title: t('common.exportFailed'),
-        description: result.error,
-        icon: 'i-heroicons-x-circle',
-        color: 'error',
-        duration: 3000,
-      })
+      toast.fail(t('common.exportFailed'), { description: result.error })
     }
   } catch (err) {
     console.error('导出失败:', err)
-    toast.add({
-      title: t('common.exportFailed'),
-      description: String(err),
-      icon: 'i-heroicons-x-circle',
-      color: 'error',
-      duration: 3000,
-    })
+    toast.fail(t('common.exportFailed'), { description: String(err) })
   } finally {
     isExporting.value = false
   }
@@ -319,7 +308,7 @@ async function openSummaryModal() {
 
 // AI 总结
 async function generateSummary() {
-  const hasConfig = await window.llmApi.hasConfig()
+  const hasConfig = await useLLMService().hasConfig()
   if (!hasConfig) {
     summaryError.value = t('common.errorNoAIConfig')
     return
@@ -351,7 +340,7 @@ ${resultSummary}
 2. 关键发现（2-4 个要点）
 3. 如有明显的趋势或异常，请指出`
 
-    const result = await window.llmApi.chatStream(
+    const result = await useLlmStreamService().chatStream(
       [
         {
           role: 'system',
@@ -406,7 +395,7 @@ defineExpose({ resetSort })
     <!-- 结果统计栏 -->
     <div
       v-if="result"
-      class="flex items-center justify-between border-b border-gray-200 bg-gray-50 px-4 py-2 dark:border-gray-800 dark:bg-gray-900"
+      class="flex items-center justify-between border-b border-gray-200 bg-gray-50 px-4 py-2 dark:border-gray-800 dark:bg-page-dark"
     >
       <div class="flex items-center gap-4 text-sm text-gray-600 dark:text-gray-400">
         <!-- 时间戳转日期开关 -->
@@ -439,7 +428,7 @@ defineExpose({ resetSort })
     <!-- 结果表格 -->
     <div v-if="result && result.rows.length > 0" class="flex-1 overflow-auto">
       <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
-        <thead class="sticky top-0 bg-gray-100 dark:bg-gray-800">
+        <thead class="sticky top-0 bg-gray-100 dark:bg-page-dark">
           <tr>
             <th
               v-for="(column, index) in result.columns"
@@ -462,10 +451,10 @@ defineExpose({ resetSort })
               </div>
             </th>
             <!-- 操作列（当有消息 ID 时显示） -->
-            <th v-if="showViewMessageButton" class="sticky right-0 w-12 bg-gray-100 px-2 py-2 dark:bg-gray-800"></th>
+            <th v-if="showViewMessageButton" class="sticky right-0 w-12 bg-gray-100 px-2 py-2 dark:bg-page-dark"></th>
           </tr>
         </thead>
-        <tbody class="divide-y divide-gray-200 bg-white dark:divide-gray-700 dark:bg-gray-900">
+        <tbody class="divide-y divide-gray-200 bg-white dark:divide-gray-700 dark:bg-page-dark">
           <tr v-for="(row, rowIndex) in sortedRows" :key="rowIndex" class="hover:bg-gray-50 dark:hover:bg-gray-800">
             <td
               v-for="(cell, cellIndex) in row"
@@ -477,7 +466,7 @@ defineExpose({ resetSort })
               {{ formatCellValue(cell, result.columns[cellIndex]) }}
             </td>
             <!-- 查看消息按钮 -->
-            <td v-if="showViewMessageButton" class="sticky right-0 w-12 bg-white px-2 py-2 dark:bg-gray-900">
+            <td v-if="showViewMessageButton" class="sticky right-0 w-12 bg-white px-2 py-2 dark:bg-page-dark">
               <UButton
                 icon="i-heroicons-chat-bubble-left-right"
                 color="neutral"
@@ -495,7 +484,7 @@ defineExpose({ resetSort })
     <!-- 分页栏 -->
     <div
       v-if="result && result.rows.length > 0 && totalPages > 1"
-      class="flex shrink-0 items-center gap-4 border-t border-gray-200 bg-gray-50 px-4 py-2 dark:border-gray-800 dark:bg-gray-900"
+      class="flex shrink-0 items-center gap-4 border-t border-gray-200 bg-gray-50 px-4 py-2 dark:border-gray-800 dark:bg-page-dark"
     >
       <!-- 翻页按钮 -->
       <div class="flex items-center gap-1">
@@ -582,7 +571,7 @@ defineExpose({ resetSort })
           <!-- 流式输出 / 最终结果 -->
           <div v-else-if="streamingContent || summaryContent" class="max-h-[50vh] overflow-y-auto">
             <div
-              class="prose prose-sm max-w-none rounded-lg bg-gray-50 p-4 dark:prose-invert dark:bg-gray-900"
+              class="prose prose-sm max-w-none rounded-lg bg-gray-50 p-4 dark:prose-invert dark:bg-page-dark"
               v-html="md.render(streamingContent || summaryContent)"
             />
             <div v-if="isSummarizing" class="mt-2 flex items-center text-xs text-gray-400">

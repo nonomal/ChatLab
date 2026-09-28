@@ -15,20 +15,23 @@ const activeTaskState = computed(() => aiChatStore.getActiveTaskState())
 const shouldShowFloatingBar = computed(() => {
   if (!activeTask.value) return false
 
+  if (activeTask.value.kind === 'global') {
+    return route.name !== 'global-ai' || route.query.aiChatId !== activeTask.value.aiChatId
+  }
+
   const expectedRouteName = activeTask.value.chatType === 'group' ? 'group-chat' : 'private-chat'
   const isOnSameSessionAIPage =
     route.name === expectedRouteName &&
     String(route.params.id ?? '') === activeTask.value.sessionId &&
-    route.query.tab === 'ai' &&
-    ((route.query.aiSubTab as string | undefined) ?? 'chat-explorer') === 'chat-explorer'
+    route.query.tab === 'ai-chat'
 
   if (!isOnSameSessionAIPage) {
     return true
   }
 
   // 正在查看当前仍在推理的那条对话时，不再重复显示浮窗入口。
-  const displayedConversationId = activeTaskState.value?.currentConversationId ?? null
-  return displayedConversationId !== (activeTask.value.conversationId ?? null)
+  const displayedAIChatId = activeTaskState.value?.currentAIChatId ?? null
+  return displayedAIChatId !== (activeTask.value.aiChatId ?? null)
 })
 
 async function handleOpenTask() {
@@ -36,12 +39,17 @@ async function handleOpenTask() {
 
   // 返回当前任务时，优先把正在流式写入的对话重新切回当前显示缓冲，
   // 避免用户此前查看了别的历史对话，回来后还停留在旧视图。
-  aiChatStore.focusActiveTaskConversation()
+  aiChatStore.focusActiveTaskAIChat()
+
+  if (activeTask.value.kind === 'global') {
+    await router.push({ name: 'global-ai', query: { aiChatId: activeTask.value.aiChatId ?? undefined } })
+    return
+  }
 
   await router.push({
     name: activeTask.value.chatType === 'group' ? 'group-chat' : 'private-chat',
     params: { id: activeTask.value.sessionId },
-    query: { tab: 'ai', aiSubTab: 'chat-explorer' },
+    query: { tab: 'ai-chat' },
   })
 }
 </script>
@@ -52,7 +60,7 @@ async function handleOpenTask() {
       <!-- 默认态直接作为返回入口，不再保留额外展开层。 -->
       <button
         class="group flex h-9 items-center gap-1.5 overflow-hidden rounded-full bg-primary-500 px-2 shadow-[0_10px_24px_rgba(15,23,42,0.12)] transition-all hover:-translate-y-0.5 hover:bg-primary-600 hover:shadow-[0_16px_32px_rgba(15,23,42,0.16)] dark:bg-primary-500 dark:hover:bg-primary-400"
-        :title="`${t('ai.chat.backgroundTask.return')} · ${activeTask.sessionName}`"
+        :title="`${t('ai.chat.backgroundTask.return')} · ${activeTask?.sessionName ?? ''}`"
         @click="handleOpenTask"
       >
         <div
